@@ -1,0 +1,638 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Switchboard (`codex-accounts`) — manage multiple Codex CLI accounts
+# Only swaps ~/.codex/auth.json; everything else in ~/.codex is preserved.
+#
+# IMPORTANT: Codex's default auth mode ("auto") may store credentials in the
+# OS keyring (macOS Keychain / Linux secret-service) instead of auth.json.
+# If your keyring is active, set this in ~/.codex/config.toml to use file storage:
+#   cli_auth_credentials_store = "file"
+#
+# Storage layout:
+#   Auth files:  ~/codex-data/<account>.json
+#   State:       ~/.codex-switch/state      (CURRENT=..., PREVIOUS=...)
+
+CODENAME="codex"
+CODEX_HOME="${HOME}/.codex"
+AUTH_FILE="${CODEX_HOME}/auth.json"
+CONFIG_FILE="${CODEX_HOME}/config.toml"
+DATA_DIR="${HOME}/codex-data"
+STATE_DIR="${HOME}/.codex-switch"
+STATE_FILE="${STATE_DIR}/state"
+USAGE_CARD_CONTENT_WIDTH=68
+
+# ------------- utils -------------
+die() { echo "[ERR] $*" >&2; exit 1; }
+note() { echo "[*] $*"; }
+ok()  { echo "[OK] $*"; }
+
+warn_if_keyring_mode() {
+  # Warn if credentials might be stored in the OS keyring instead of auth.json.
+  if [[ -f "$CONFIG_FILE" ]]; then
+    local store
+    store="$(grep -E '^\s*cli_auth_credentials_store\s*=' "$CONFIG_FILE" 2>/dev/null | tail -1 | sed 's/.*=\s*"\?\([^"]*\)"\?/\1/' || true)"
+    if [[ "$store" == "keyring" ]]; then
+      echo "[WARN] cli_auth_credentials_store is set to 'keyring'."
+      echo "       This script only swaps auth.json and cannot manage keyring entries."
+      echo "       Set cli_auth_credentials_store = \"file\" in ~/.codex/config.toml."
+      return
+    fi
+  fi
+  # Default mode is "auto" — warn if auth.json is missing but ~/.codex exists
+  if [[ -d "$CODEX_HOME" && ! -f "$AUTH_FILE" ]]; then
+    echo "[WARN] ~/.codex exists but auth.json is missing — credentials may be in the OS keyring."
+    echo "       Add cli_auth_credentials_store = \"file\" to ~/.codex/config.toml,"
+    echo "       then run '${CODENAME} login' again."
+  fi
+}
+
+ensure_dirs() {
+  mkdir -p "$DATA_DIR" "$STATE_DIR"
+}
+
+load_state() {
+  CURRENT=""; PREVIOUS=""
+  if [[ -f "$STATE_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$STATE_FILE" || true
+  fi
+}
+
+save_state() {
+  local cur="$1" prev="$2"
+  printf "CURRENT=%q\nPREVIOUS=%q\n" "$cur" "$prev" > "$STATE_FILE"
+}
+
+need_cmd() {
+  local cmd="$1"
+  command -v "$cmd" >/dev/null 2>&1 || die "'$cmd' is required for this command."
+}
+
+repeat_char() {
+  local char="$1" count="$2" out="" i
+  for ((i = 0; i < count; i++)); do
+    out+="$char"
+  done
+  printf '%s' "$out"
+}
+
+fit_text() {
+  local text="$1" width="$2"
+  awk -v s="$text" -v width="$width" '
+    BEGIN {
+      out = ""
+      gsub(/\n/, " ", s)
+      gsub(/[[:space:]]+/, " ", s)
+      sub(/^ /, "", s)
+      sub(/ $/, "", s)
+
+      if (length(s) > width) {
+        if (width > 3) {
+          s = substr(s, 1, width - 3) "..."
+        } else {
+          s = substr(s, 1, width)
+        }
+      }
+
+      out = s
+      while (length(out) < width) {
+        out = out " "
+      }
+      printf "%s", out
+    }'
+}
+
+format_compact_number() {
+  local value="$1"
+  if [[ "$value" =~ ^-?[0-9]+(\.[0-9]+)?$ ]]; then
+    printf '%s' "$value" | sed -E 's/(\.[0-9]*[1-9])0+$/\1/; s/\.0+$//'
+  else
+    printf '%s' "$value"
+  fi
+}
+
+format_epoch_local() {
+  local epoch="$1" fmt="$2"
+  [[ -z "$epoch" || "$epoch" == "null" ]] && return 1
+
+  if date -d "@$epoch" +"$fmt" >/dev/null 2>&1; then
+    date -d "@$epoch" +"$fmt"
+  elif date -r "$epoch" +"$fmt" >/dev/null 2>&1; then
+    date -r "$epoch" +"$fmt"
+  else
+    return 1
+  fi
+}
+
+format_reset_time() {
+  local epoch="$1" today reset_day reset_text
+
+  if [[ -z "$epoch" || "$epoch" == "null" ]]; then
+    echo "unknown"
+    return 0
+  fi
+
+  today="$(date +"%Y-%m-%d" 2>/dev/null || true)"
+  reset_day="$(format_epoch_local "$epoch" "%Y-%m-%d" 2>/dev/null || true)"
+  if [[ -n "$today" && "$today" == "$reset_day" ]]; then
+    format_epoch_local "$epoch" "%H:%M" 2>/dev/null || echo "$epoch"
+  else
+    reset_text="$(format_epoch_local "$epoch" "%H:%M on %e %b" 2>/dev/null || echo "$epoch")"
+    echo "$reset_text" | sed 's/^ *//'
+  fi
+}
+
+percent_left() {
+  local used="${1:-0}" left
+  [[ -z "$used" || "$used" == "null" ]] && used=0
+  left=$((100 - used))
+  (( left < 0 )) && left=0
+  (( left > 100 )) && left=100
+  echo "$left"
+}
+
+render_usage_bar() {
+  local left_percent="$1" width="${2:-16}" filled empty out=""
+  local i
+
+  filled=$(( (left_percent * width + 50) / 100 ))
+  (( filled < 0 )) && filled=0
+  (( filled > width )) && filled=width
+  empty=$((width - filled))
+
+  out+='['
+  for ((i = 0; i < filled; i++)); do
+    out+='█'
+  done
+  for ((i = 0; i < empty; i++)); do
+    out+='░'
+  done
+  out+=']'
+  printf '%s' "$out"
+}
+
+window_label() {
+  local mins="$1"
+  case "$mins" in
+    300) echo "5h limit:" ;;
+    10080) echo "Weekly limit:" ;;
+    "")
+      echo "Usage:"
+      ;;
+    *)
+      if (( mins % 1440 == 0 )); then
+        echo "$((mins / 1440))d limit:"
+      elif (( mins % 60 == 0 )); then
+        echo "$((mins / 60))h limit:"
+      else
+        echo "${mins}m limit:"
+      fi
+      ;;
+  esac
+}
+
+format_limit_line() {
+  local label="$1" used="$2" reset_epoch="$3"
+  local left bar reset_text
+
+  if [[ -z "$used" || "$used" == "null" ]]; then
+    printf '%-13s %s' "$label" "unavailable"
+    return 0
+  fi
+
+  left="$(percent_left "$used")"
+  bar="$(render_usage_bar "$left" 16)"
+  reset_text="$(format_reset_time "$reset_epoch")"
+  printf '%-13s %s %3s%% left (resets %s)' "$label" "$bar" "$left" "$reset_text"
+}
+
+format_credits_line() {
+  local credit_mode="$1" credit_balance="$2"
+  if [[ -n "$credit_balance" ]]; then
+    credit_balance="$(format_compact_number "$credit_balance")"
+  fi
+  if [[ -n "$credit_mode" && -n "$credit_balance" ]]; then
+    echo "Credits: ${credit_mode}, balance=${credit_balance}"
+  elif [[ -n "$credit_mode" ]]; then
+    echo "Credits: ${credit_mode}"
+  elif [[ -n "$credit_balance" ]]; then
+    echo "Credits: balance=${credit_balance}"
+  else
+    echo "Credits: unavailable"
+  fi
+}
+
+summarize_rate_error() {
+  local err="$1"
+  if [[ "$err" == *"token_expired"* || "$err" == *"401 Unauthorized"* ]]; then
+    echo "token expired; run codex login + save"
+  else
+    printf '%s' "$err" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//'
+  fi
+}
+
+build_usage_card() {
+  local title="$1" account_line="$2" primary_line="$3" secondary_line="$4" footer_line="$5"
+  local content_width="$USAGE_CARD_CONTENT_WIDTH" border
+
+  border="$(repeat_char '─' $((content_width + 2)))"
+  printf '┌%s┐\n' "$border"
+  printf '│ %s │\n' "$(fit_text "$title" "$content_width")"
+  printf '│ %s │\n' "$(fit_text "$account_line" "$content_width")"
+  printf '│ %s │\n' "$(fit_text "$primary_line" "$content_width")"
+  printf '│ %s │\n' "$(fit_text "$secondary_line" "$content_width")"
+  printf '│ %s │\n' "$(fit_text "$footer_line" "$content_width")"
+  printf '└%s┘' "$border"
+}
+
+render_usage_grid() {
+  local -a cards=( "$@" )
+  local i line_count
+  local -a lines
+
+  for ((i = 0; i < ${#cards[@]}; i++)); do
+    mapfile -t lines <<< "${cards[i]}"
+    line_count="${#lines[@]}"
+    for ((line = 0; line < line_count; line++)); do
+      printf '%s\n' "${lines[line]}"
+    done
+    if (( i + 1 < ${#cards[@]} )); then
+      echo
+    fi
+  done
+}
+
+query_active_account_status() {
+  local home_root="${1:-$HOME}"
+  need_cmd codex
+  need_cmd jq
+
+  local stderr_file line response_id attempts
+  local account_response="" rate_response=""
+
+  stderr_file="$(mktemp "${TMPDIR:-/tmp}/codex-accounts-app-server.XXXXXX")"
+
+  # shellcheck disable=SC2034
+  coproc APP_SERVER { HOME="$home_root" codex app-server --listen stdio:// 2>"$stderr_file"; }
+  local app_pid="$APP_SERVER_PID"
+
+  printf '%s\n' '{"id":"init-1","method":"initialize","params":{"clientInfo":{"name":"codex-accounts","title":"codex-accounts","version":"1.0.0"},"capabilities":{"experimentalApi":true,"optOutNotificationMethods":["thread/started","thread/status/changed","turn/started","item/started","item/completed"]}}}' >&"${APP_SERVER[1]}"
+  printf '%s\n' '{"method":"initialized"}' >&"${APP_SERVER[1]}"
+  printf '%s\n' '{"id":"acct-1","method":"account/read","params":{"refreshToken":false}}' >&"${APP_SERVER[1]}"
+  printf '%s\n' '{"id":"rate-1","method":"account/rateLimits/read","params":null}' >&"${APP_SERVER[1]}"
+
+  attempts=0
+  while [[ $attempts -lt 12 ]]; do
+    attempts=$((attempts + 1))
+    if IFS= read -r -t 2 line <&"${APP_SERVER[0]}"; then
+      response_id="$(printf '%s' "$line" | jq -r '.id // empty' 2>/dev/null || true)"
+      case "$response_id" in
+        acct-1) account_response="$line" ;;
+        rate-1) rate_response="$line" ;;
+      esac
+      [[ -n "$account_response" && -n "$rate_response" ]] && break
+    fi
+  done
+
+  kill "$app_pid" >/dev/null 2>&1 || true
+  wait "$app_pid" >/dev/null 2>&1 || true
+
+  if [[ -z "$account_response" ]]; then
+    local stderr_preview=""
+    if [[ -s "$stderr_file" ]]; then
+      stderr_preview="$(sed -n '1,5p' "$stderr_file" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g')"
+    fi
+    rm -f "$stderr_file"
+    die "Codex did not return account information.${stderr_preview:+ ${stderr_preview}}"
+  fi
+
+  if ! printf '%s' "$account_response" | jq -e '.result.account' >/dev/null 2>&1; then
+    local account_error
+    account_error="$(printf '%s' "$account_response" | jq -r '.error.message // "Unknown account/read error."' 2>/dev/null || true)"
+    rm -f "$stderr_file"
+    die "${account_error:-Unknown account/read error.}"
+  fi
+
+  [[ -n "$rate_response" ]] || rate_response='{"error":{"message":"No response from account/rateLimits/read"}}'
+  rm -f "$stderr_file"
+
+  jq -nc \
+    --arg account_response "$account_response" \
+    --arg rate_response "$rate_response" \
+    '{
+      account: (($account_response | fromjson).result.account // null),
+      requiresOpenaiAuth: (($account_response | fromjson).result.requiresOpenaiAuth // false),
+      rateLimits: (($rate_response | fromjson).result.rateLimits // null),
+      rateLimitsByLimitId: (($rate_response | fromjson).result.rateLimitsByLimitId // null),
+      rateError: (($rate_response | fromjson).error.message // null)
+    }'
+}
+
+query_status_for_saved_auth() {
+  local saved_auth="$1"
+  local temp_home temp_codex_home snapshot rc=0
+
+  temp_home="$(mktemp -d "${TMPDIR:-/tmp}/codex-accounts-home.XXXXXX")"
+  temp_codex_home="${temp_home}/.codex"
+  mkdir -p "$temp_codex_home"
+  cp "$saved_auth" "$temp_codex_home/auth.json"
+
+  if snapshot="$(query_active_account_status "$temp_home" 2>&1)"; then
+    :
+  else
+    rc=$?
+  fi
+
+  rm -rf "$temp_home"
+
+  printf '%s' "$snapshot"
+  return "$rc"
+}
+
+saved_auth_for() {
+  local name="$1"
+  echo "${DATA_DIR}/${name}.json"
+}
+
+assert_auth_present_or_hint() {
+  if [[ ! -f "$AUTH_FILE" ]]; then
+    die "~/.codex/auth.json not found. You likely haven't logged in yet.
+Install Codex:  brew install codex
+Then run:       ${CODENAME} login"
+  fi
+}
+
+prompt_account_name() {
+  local ans
+  read -r -p "Enter a name for the CURRENT logged-in account (e.g., bashar, tazrin): " ans
+  [[ -z "${ans:-}" ]] && die "Account name cannot be empty."
+  echo "$ans"
+}
+
+backup_current_to() {
+  local name="$1"
+  assert_auth_present_or_hint
+
+  local dest; dest="$(saved_auth_for "$name")"
+  note "Saving current auth.json as '${name}'..."
+  cp "$AUTH_FILE" "$dest"
+  ok "Saved."
+}
+
+restore_auth_from() {
+  local saved="$1"
+  [[ -f "$saved" ]] || die "Saved auth file not found: $saved"
+
+  mkdir -p "$CODEX_HOME"
+  note "Restoring auth.json..."
+  cp "$saved" "$AUTH_FILE"
+  ok "Activated auth.json into ~/.codex/."
+}
+
+resolve_current_name_or_prompt() {
+  # If CURRENT unknown but auth.json exists, ask user to name it so we can save it.
+  load_state
+  if [[ -z "${CURRENT:-}" && -f "$AUTH_FILE" ]]; then
+    local named; named="$(prompt_account_name)"
+    backup_current_to "$named"
+    PREVIOUS=""        # No meaningful previous yet
+    CURRENT="$named"
+    save_state "$CURRENT" "$PREVIOUS"
+  fi
+}
+
+# ------------- commands -------------
+cmd_list() {
+  ensure_dirs
+  shopt -s nullglob
+  local any=0
+  for f in "$DATA_DIR"/*.json; do
+    any=1
+    echo " - $(basename "${f%.json}")"
+  done
+  [[ $any -eq 0 ]] && echo "(no accounts saved yet)"
+}
+
+cmd_current() {
+  load_state
+  if [[ -n "${CURRENT:-}" ]]; then
+    echo "Current:  $CURRENT"
+  else
+    echo "Current:  (unknown — no state recorded yet)"
+  fi
+  if [[ -n "${PREVIOUS:-}" ]]; then
+    echo "Previous: $PREVIOUS"
+  fi
+}
+
+cmd_save() {
+  # Save the currently logged-in auth.json under a name
+  ensure_dirs
+  assert_auth_present_or_hint
+  local name="${1:-}"
+  if [[ -z "$name" ]]; then
+    name="$(prompt_account_name)"
+  fi
+  backup_current_to "$name"
+
+  # Update CURRENT, leave PREVIOUS as-is if already set
+  load_state
+  PREVIOUS="${CURRENT:-}"
+  CURRENT="$name"
+  save_state "$CURRENT" "$PREVIOUS"
+}
+
+cmd_add() {
+  # Add a NEW account slot:
+  #  - If auth.json exists, back it up under CURRENT (or prompt for a name if unknown)
+  #  - Remove auth.json so user can run `codex login` for the NEW account
+  #  - Everything else in ~/.codex is preserved
+  ensure_dirs
+  resolve_current_name_or_prompt   # backs up & sets CURRENT if needed
+
+  local newname="${1:-}"; [[ -z "$newname" ]] && die "Usage: $0 add <new-account-name>"
+
+  if [[ -f "$AUTH_FILE" ]]; then
+    note "Removing auth.json to prepare login for '${newname}'..."
+    rm -f "$AUTH_FILE"
+  fi
+  ok "Ready. Now run: ${CODENAME} login  (to authenticate '${newname}')"
+  echo "After login completes, run: $0 save ${newname}   (to store the new account)"
+}
+
+cmd_switch() {
+  # Switch to an existing saved account by name:
+  #  - Ensure the saved auth file exists
+  #  - If auth.json exists, back it up under CURRENT (or prompt to name it)
+  #  - Copy the target auth.json into ~/.codex/
+  local target="${1:-}"; [[ -z "$target" ]] && die "Usage: $0 switch <account-name>"
+
+  ensure_dirs
+  resolve_current_name_or_prompt   # may back up and set CURRENT if previously unknown
+
+  local saved; saved="$(saved_auth_for "$target")"
+  [[ -f "$saved" ]] || die "No saved account named '${target}'. Use '$0 list' to see options."
+
+  if [[ -f "$AUTH_FILE" ]]; then
+    # Always back up current before switching
+    load_state
+    if [[ -z "${CURRENT:-}" ]]; then
+      CURRENT="$(prompt_account_name)"
+    fi
+    backup_current_to "$CURRENT"
+  fi
+
+  note "Switching to '${target}'..."
+  restore_auth_from "$saved"
+
+  # Update state
+  load_state
+  PREVIOUS="${CURRENT:-}"
+  CURRENT="$target"
+  save_state "$CURRENT" "$PREVIOUS"
+  ok "Switched. Current account: ${CURRENT}"
+}
+
+cmd_usage() {
+  ensure_dirs
+
+  need_cmd codex
+  need_cmd jq
+
+  shopt -s nullglob
+  local saved_accounts=( "$DATA_DIR"/*.json )
+  [[ ${#saved_accounts[@]} -gt 0 ]] || die "No saved accounts found in ${DATA_DIR}. Use '$0 save <name>' first."
+
+  load_state
+  local saved name marker snapshot auth_type email plan rate_error
+  local bucket_json primary_used primary_window primary_reset secondary_used secondary_window secondary_reset credit_mode credit_balance
+  local title account_line primary_line secondary_line footer_line
+  local -a cards=()
+
+  echo "Switchboard usage"
+  echo "Source: codex app-server account/read + account/rateLimits/read"
+  echo "Windows: 5h + Weekly"
+  echo
+
+  for saved in "${saved_accounts[@]}"; do
+    name="$(basename "${saved%.json}")"
+    marker=""
+    [[ "${CURRENT:-}" == "$name" ]] && marker=" (current)"
+
+    if snapshot="$(query_status_for_saved_auth "$saved" 2>&1)"; then
+      auth_type="$(printf '%s' "$snapshot" | jq -r '.account.type // "unknown"')"
+      email="$(printf '%s' "$snapshot" | jq -r '.account.email // empty')"
+      plan="$(printf '%s' "$snapshot" | jq -r '.account.planType // "unknown"')"
+      rate_error="$(printf '%s' "$snapshot" | jq -r '.rateError // empty')"
+
+      bucket_json="$(printf '%s' "$snapshot" | jq -c '
+        (.rateLimitsByLimitId.codex
+          // ((.rateLimitsByLimitId // {}) | to_entries[0].value)
+          // .rateLimits
+          // {})')"
+
+      primary_used="$(printf '%s' "$bucket_json" | jq -r '.primary.usedPercent // empty')"
+      primary_window="$(printf '%s' "$bucket_json" | jq -r '.primary.windowDurationMins // empty')"
+      primary_reset="$(printf '%s' "$bucket_json" | jq -r '.primary.resetsAt // empty')"
+      secondary_used="$(printf '%s' "$bucket_json" | jq -r '.secondary.usedPercent // empty')"
+      secondary_window="$(printf '%s' "$bucket_json" | jq -r '.secondary.windowDurationMins // empty')"
+      secondary_reset="$(printf '%s' "$bucket_json" | jq -r '.secondary.resetsAt // empty')"
+      credit_mode="$(printf '%s' "$bucket_json" | jq -r 'if .credits == null then "" else (if .credits.unlimited then "unlimited" else "limited" end) end')"
+      credit_balance="$(printf '%s' "$bucket_json" | jq -r '.credits.balance // empty')"
+
+      title="${name}${marker}"
+      if [[ "$auth_type" == "chatgpt" ]]; then
+        account_line="${email:-unknown} · ${plan}"
+      else
+        account_line="API key · ${plan}"
+      fi
+
+      if [[ -n "$rate_error" ]]; then
+        primary_line="Usage: unavailable"
+        secondary_line="Detail: $(summarize_rate_error "$rate_error")"
+        footer_line="$(format_credits_line "$credit_mode" "$credit_balance")"
+      else
+        primary_line="$(format_limit_line "$(window_label "$primary_window")" "$primary_used" "$primary_reset")"
+        secondary_line="$(format_limit_line "$(window_label "$secondary_window")" "$secondary_used" "$secondary_reset")"
+        footer_line="$(format_credits_line "$credit_mode" "$credit_balance")"
+      fi
+    else
+      title="${name}${marker}"
+      account_line="Status query failed"
+      primary_line="Usage: unavailable"
+      secondary_line="Detail: $(summarize_rate_error "$snapshot")"
+      footer_line=""
+    fi
+
+    cards+=( "$(build_usage_card "$title" "$account_line" "$primary_line" "$secondary_line" "$footer_line")" )
+  done
+
+  render_usage_grid "${cards[@]}"
+}
+
+cmd_help() {
+  cat <<EOF
+Switchboard (`codex-accounts`) — manage multiple Codex CLI accounts
+
+Only ~/.codex/auth.json is swapped; all other config/state is preserved.
+
+USAGE
+  $0 list
+      Show all saved accounts (from ${DATA_DIR}).
+
+  $0 current
+      Show current and previous accounts from the state.
+
+  $0 save [<name>]
+      Save the current auth.json into ${DATA_DIR}/<name>.json.
+      If <name> is omitted, you'll be prompted.
+
+  $0 add <name>
+      Prepare to add a new account:
+        - backs up current auth.json (prompting for its name if unknown),
+        - removes auth.json so you can run 'codex login',
+        - after login, run: $0 save <name>
+
+  $0 switch <name>
+      Switch to an existing saved account (name is mandatory).
+      Backs up current auth.json first, then activates <name>.
+
+  $0 usage
+      For each saved account, runs Codex inside an isolated temporary HOME,
+      calls Codex's account/read + account/rateLimits/read endpoints,
+      and renders 5-hour + weekly usage cards one per row.
+      This is read-only and does not modify your active ~/.codex/auth.json
+      or saved account files.
+
+NOTES
+  - Core switching is shell-only; 'usage' requires jq and network access.
+  - If auth.json is missing when saving/adding, you'll be prompted to login first.
+  - Codex default auth mode ("auto") may use the OS keyring instead of auth.json.
+    If so, add this to ~/.codex/config.toml:  cli_auth_credentials_store = "file"
+    Then run 'codex login' again to write auth.json.
+  - Install Codex if needed:  brew install codex
+EOF
+}
+
+# ------------- main -------------
+main() {
+  ensure_dirs
+
+  local cmd="${1:-help}"; shift || true
+  if [[ "$cmd" != "usage" ]]; then
+    warn_if_keyring_mode
+  fi
+  case "$cmd" in
+    list)    cmd_list "$@";;
+    current) cmd_current "$@";;
+    save)    cmd_save "$@";;
+    add)     cmd_add "$@";;
+    switch)  cmd_switch "$@";;
+    usage)   cmd_usage "$@";;
+    help|--help|-h) cmd_help;;
+    *) die "Unknown command: $cmd. See '$0 help'.";;
+  esac
+}
+
+main "$@"
