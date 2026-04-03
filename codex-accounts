@@ -248,19 +248,30 @@ build_usage_card() {
 
 render_usage_grid() {
   local -a cards=( "$@" )
-  local i line_count
-  local -a lines
+  local i line
 
   for ((i = 0; i < ${#cards[@]}; i++)); do
-    mapfile -t lines <<< "${cards[i]}"
-    line_count="${#lines[@]}"
-    for ((line = 0; line < line_count; line++)); do
-      printf '%s\n' "${lines[line]}"
-    done
+    while IFS= read -r line; do
+      printf '%s\n' "$line"
+    done <<< "${cards[i]}"
     if (( i + 1 < ${#cards[@]} )); then
       echo
     fi
   done
+}
+
+cleanup_app_server_io() {
+  local app_pid="${1:-}" pipe_dir="${2:-}"
+
+  exec 3>&- 2>/dev/null || true
+  exec 4>&- 2>/dev/null || true
+
+  if [[ -n "$app_pid" ]]; then
+    kill "$app_pid" >/dev/null 2>&1 || true
+    wait "$app_pid" >/dev/null 2>&1 || true
+  fi
+
+  [[ -n "$pipe_dir" ]] && rm -rf "$pipe_dir"
 }
 
 query_active_account_status() {
@@ -268,24 +279,30 @@ query_active_account_status() {
   need_cmd codex
   need_cmd jq
 
-  local stderr_file line response_id attempts
+  local stderr_file pipe_dir stdin_pipe stdout_pipe line response_id attempts app_pid
   local account_response="" rate_response=""
 
   stderr_file="$(mktemp "${TMPDIR:-/tmp}/codex-accounts-app-server.XXXXXX")"
+  pipe_dir="$(mktemp -d "${TMPDIR:-/tmp}/codex-accounts-app-server.XXXXXX")"
+  stdin_pipe="${pipe_dir}/stdin"
+  stdout_pipe="${pipe_dir}/stdout"
+  mkfifo "$stdin_pipe" "$stdout_pipe"
 
-  # shellcheck disable=SC2034
-  coproc APP_SERVER { HOME="$home_root" codex app-server --listen stdio:// 2>"$stderr_file"; }
-  local app_pid="$APP_SERVER_PID"
+  exec 3<>"$stdin_pipe"
+  exec 4<>"$stdout_pipe"
 
-  printf '%s\n' '{"id":"init-1","method":"initialize","params":{"clientInfo":{"name":"codex-accounts","title":"codex-accounts","version":"1.0.0"},"capabilities":{"experimentalApi":true,"optOutNotificationMethods":["thread/started","thread/status/changed","turn/started","item/started","item/completed"]}}}' >&"${APP_SERVER[1]}"
-  printf '%s\n' '{"method":"initialized"}' >&"${APP_SERVER[1]}"
-  printf '%s\n' '{"id":"acct-1","method":"account/read","params":{"refreshToken":false}}' >&"${APP_SERVER[1]}"
-  printf '%s\n' '{"id":"rate-1","method":"account/rateLimits/read","params":null}' >&"${APP_SERVER[1]}"
+  HOME="$home_root" codex app-server --listen stdio:// <"$stdin_pipe" >"$stdout_pipe" 2>"$stderr_file" &
+  app_pid="$!"
+
+  printf '%s\n' '{"id":"init-1","method":"initialize","params":{"clientInfo":{"name":"codex-accounts","title":"codex-accounts","version":"1.0.0"},"capabilities":{"experimentalApi":true,"optOutNotificationMethods":["thread/started","thread/status/changed","turn/started","item/started","item/completed"]}}}' >&3
+  printf '%s\n' '{"method":"initialized"}' >&3
+  printf '%s\n' '{"id":"acct-1","method":"account/read","params":{"refreshToken":false}}' >&3
+  printf '%s\n' '{"id":"rate-1","method":"account/rateLimits/read","params":null}' >&3
 
   attempts=0
   while [[ $attempts -lt 12 ]]; do
     attempts=$((attempts + 1))
-    if IFS= read -r -t 2 line <&"${APP_SERVER[0]}"; then
+    if IFS= read -r -t 2 line <&4; then
       response_id="$(printf '%s' "$line" | jq -r '.id // empty' 2>/dev/null || true)"
       case "$response_id" in
         acct-1) account_response="$line" ;;
@@ -295,8 +312,7 @@ query_active_account_status() {
     fi
   done
 
-  kill "$app_pid" >/dev/null 2>&1 || true
-  wait "$app_pid" >/dev/null 2>&1 || true
+  cleanup_app_server_io "$app_pid" "$pipe_dir"
 
   if [[ -z "$account_response" ]]; then
     local stderr_preview=""
@@ -573,7 +589,7 @@ cmd_usage() {
 
 cmd_help() {
   cat <<EOF
-Switchboard (`codex-accounts`) — manage multiple Codex CLI accounts
+Switchboard (codex-accounts) — manage multiple Codex CLI accounts
 
 Only ~/.codex/auth.json is swapped; all other config/state is preserved.
 
