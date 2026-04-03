@@ -1,16 +1,12 @@
+# Codex Account Manager
+
+Manage multiple Codex CLI accounts with ease. 
+
 <p align="center">
   <a href="https://jojoml.github.io/tools/codex-accounts-demo.html">
     <img src="https://jojoml.github.io/tools/codex-accounts-demo-preview.gif" alt="Codex Account Manager demo preview" width="100%">
   </a>
 </p>
-
-<p align="center">
-  <a href="https://jojoml.github.io/tools/codex-accounts-demo.html">Watch the full demo</a>
-</p>
-
-# Codex Account Manager
-
-Switch between multiple Codex accounts without wiping your local Codex history.
 
 `codex-accounts` only swaps `~/.codex/auth.json`. Your sessions, logs, memories, config, and the rest of `~/.codex` stay in place.
 
