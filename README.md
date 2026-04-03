@@ -2,13 +2,17 @@
 
 Manage multiple Codex CLI accounts with ease. 
 
-<p align="center">
-  <a href="https://jojoml.github.io/tools/codex-accounts-demo.html">
-    <img src="https://jojoml.github.io/tools/codex-accounts-demo-preview.gif" alt="Codex Account Manager demo preview" width="100%">
-  </a>
-</p>
+*`codex-accounts` only swaps `~/.codex/auth.json`. Your sessions, logs, memories, config, and the rest of `~/.codex` stay in place.*
 
-`codex-accounts` only swaps `~/.codex/auth.json`. Your sessions, logs, memories, config, and the rest of `~/.codex` stay in place.
+<!-- <p align="center">
+  <a href="https://jojoml.github.io/tools/codex-accounts-demo.html">
+    <img src="https://jojoml.github.io/tools/codex-accounts-demo-preview.gif" alt="Codex Account Manager demo preview" width="50%">
+  </a>
+</p> -->
+
+https://github.com/user-attachments/assets/fca2f26f-28e1-4d89-8a19-bcd3272507c7
+
+
 
 ## Install
 
