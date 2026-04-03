@@ -1,3 +1,7 @@
+<video src="./codex-accounts-demo.mp4" controls muted playsinline width="100%"></video>
+
+[Watch the demo video](./codex-accounts-demo.mp4)
+
 # Codex Account Manager
 
 Switch between multiple Codex accounts without wiping your local Codex history.
