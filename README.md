@@ -13,7 +13,7 @@ Switch between multiple Codex accounts without wiping your local Codex history.
 Interactive install:
 
 ```bash
-curl -fsSL https://jojo23333.github.io/install/codex-accounts.sh | bash
+curl -fsSL https://jojoml.github.io/tools/codex-accounts.sh | bash
 ```
 
 The installer will:
@@ -27,8 +27,8 @@ The installer will:
 Non-interactive install:
 
 ```bash
-curl -fsSL https://jojo23333.github.io/install/codex-accounts.sh | bash -s -- --shell zsh
-curl -fsSL https://jojo23333.github.io/install/codex-accounts.sh | bash -s -- --shell bash
+curl -fsSL https://jojoml.github.io/tools/codex-accounts.sh | bash -s -- --shell zsh
+curl -fsSL https://jojoml.github.io/tools/codex-accounts.sh | bash -s -- --shell bash
 ```
 
 ## Quick Start
