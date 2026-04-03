@@ -1,6 +1,12 @@
-<video src="./codex-accounts-demo.mp4" controls muted playsinline width="100%"></video>
+<p align="center">
+  <a href="https://jojoml.github.io/tools/codex-accounts-demo.html">
+    <img src="https://jojoml.github.io/tools/codex-accounts-demo-preview.gif" alt="Codex Account Manager demo preview" width="100%">
+  </a>
+</p>
 
-[Watch the demo video](./codex-accounts-demo.mp4)
+<p align="center">
+  <a href="https://jojoml.github.io/tools/codex-accounts-demo.html">Watch the full demo</a>
+</p>
 
 # Codex Account Manager
 
