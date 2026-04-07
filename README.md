@@ -1,8 +1,8 @@
 # Codex Account Manager
 
-Manage multiple Codex CLI accounts with ease. 
+Manage multiple Codex CLI accounts with ease.
 
-*`codex-accounts` only swaps `~/.codex/auth.json`. Your sessions, logs, memories, config, and the rest of `~/.codex` stay in place.*
+*`codex-accounts` swaps `~/.codex/auth.json` and the account-specific parts of `~/.codex/config.toml`. Local project trust settings under `[projects."<path>"]` stay on your machine.*
 
 https://github.com/user-attachments/assets/fca2f26f-28e1-4d89-8a19-bcd3272507c7
 
@@ -38,6 +38,9 @@ curl -fsSL https://jojoml.github.io/tools/codex-accounts.sh | bash -s -- --shell
 codex login
 codex-accounts save personal
 
+# If this account needs a custom provider/model, set ~/.codex/config.toml first
+# then save it so those settings travel with the account
+
 # Add another account
 codex-accounts add work
 codex login
@@ -70,7 +73,7 @@ codex-accounts usage
 
 ## Important: File-Based Auth
 
-This tool only manages `~/.codex/auth.json`.
+This tool manages `~/.codex/auth.json` and account-scoped config snapshots.
 
 If Codex is using the OS keychain/keyring, there may be no `auth.json` file to switch. In that case, set Codex to file-based credentials:
 
@@ -87,9 +90,10 @@ codex login
 
 ## What It Changes
 
-When you switch accounts, it only touches:
+When you switch accounts, it updates:
 
 - `~/.codex/auth.json`
+- `~/.codex/config.toml` except local `[projects."<path>"]` sections
 - `~/.codex-switch/state`
 
 Everything else under `~/.codex` stays where it is, including:
@@ -98,7 +102,6 @@ Everything else under `~/.codex` stays where it is, including:
 - `sessions/`
 - `log/`
 - `memories/`
-- `config.toml`
 
 ## Requirements
 
@@ -115,5 +118,7 @@ brew install codex
 ## Notes
 
 - saved accounts are stored as plain `auth.json` copies under `~/codex-data`
+- saved config snapshots are stored under `~/codex-data/<name>.config.toml`
+- `[projects."<path>"]` trust settings stay local and are merged back in on switch
 - protect `~/codex-data` like any other credential store
 - if a saved account shows an expired token in `usage`, log into that account again and run `codex-accounts save <name>`

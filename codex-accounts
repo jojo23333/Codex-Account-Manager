@@ -2,7 +2,8 @@
 set -euo pipefail
 
 # Switchboard (`codex-accounts`) — manage multiple Codex CLI accounts
-# Only swaps ~/.codex/auth.json; everything else in ~/.codex is preserved.
+# Swaps ~/.codex/auth.json and account-scoped config settings.
+# Project trust under [projects."<path>"] stays local to the current machine.
 #
 # IMPORTANT: Codex's default auth mode ("auto") may store credentials in the
 # OS keyring (macOS Keychain / Linux secret-service) instead of auth.json.
@@ -10,8 +11,9 @@ set -euo pipefail
 #   cli_auth_credentials_store = "file"
 #
 # Storage layout:
-#   Auth files:  ~/codex-data/<account>.json
-#   State:       ~/.codex-switch/state      (CURRENT=..., PREVIOUS=...)
+#   Auth files:    ~/codex-data/<account>.json
+#   Config files:  ~/codex-data/<account>.config.toml  (without [projects.*])
+#   State:         ~/.codex-switch/state               (CURRENT=..., PREVIOUS=...)
 
 CODENAME="codex"
 CODEX_HOME="${HOME}/.codex"
@@ -67,6 +69,11 @@ save_state() {
 need_cmd() {
   local cmd="$1"
   command -v "$cmd" >/dev/null 2>&1 || die "'$cmd' is required for this command."
+}
+
+file_has_non_whitespace() {
+  local path="$1"
+  [[ -f "$path" ]] && grep -q '[^[:space:]]' "$path"
 }
 
 repeat_char() {
@@ -347,12 +354,16 @@ query_active_account_status() {
 
 query_status_for_saved_auth() {
   local saved_auth="$1"
+  local saved_config="${2:-}"
   local temp_home temp_codex_home snapshot rc=0
 
   temp_home="$(mktemp -d "${TMPDIR:-/tmp}/codex-accounts-home.XXXXXX")"
   temp_codex_home="${temp_home}/.codex"
   mkdir -p "$temp_codex_home"
   cp "$saved_auth" "$temp_codex_home/auth.json"
+  if [[ -n "$saved_config" && -f "$saved_config" ]]; then
+    cp "$saved_config" "$temp_codex_home/config.toml"
+  fi
 
   if snapshot="$(query_active_account_status "$temp_home" 2>&1)"; then
     :
@@ -369,6 +380,107 @@ query_status_for_saved_auth() {
 saved_auth_for() {
   local name="$1"
   echo "${DATA_DIR}/${name}.json"
+}
+
+saved_config_for() {
+  local name="$1"
+  echo "${DATA_DIR}/${name}.config.toml"
+}
+
+strip_project_tables() {
+  local source="$1" dest="$2"
+
+  if [[ ! -f "$source" ]]; then
+    : > "$dest"
+    return 0
+  fi
+
+  awk '
+    BEGIN { in_projects = 0 }
+    /^[[:space:]]*\[/ {
+      if ($0 ~ /^[[:space:]]*\[projects\./) {
+        in_projects = 1
+        next
+      }
+      in_projects = 0
+    }
+    !in_projects { print }
+  ' "$source" > "$dest"
+}
+
+extract_project_tables() {
+  local source="$1" dest="$2"
+
+  if [[ ! -f "$source" ]]; then
+    : > "$dest"
+    return 0
+  fi
+
+  awk '
+    BEGIN { in_projects = 0 }
+    /^[[:space:]]*\[/ {
+      in_projects = ($0 ~ /^[[:space:]]*\[projects\./)
+    }
+    in_projects { print }
+  ' "$source" > "$dest"
+}
+
+save_current_config_to() {
+  local name="$1"
+  local dest tmp
+
+  dest="$(saved_config_for "$name")"
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    rm -f "$dest"
+    return 0
+  fi
+
+  tmp="$(mktemp "${TMPDIR:-/tmp}/codex-accounts-config.XXXXXX")"
+  strip_project_tables "$CONFIG_FILE" "$tmp"
+
+  if file_has_non_whitespace "$tmp"; then
+    mv "$tmp" "$dest"
+  else
+    rm -f "$tmp" "$dest"
+  fi
+}
+
+restore_config_from() {
+  local name="$1"
+  local saved project_tmp merged_tmp had_saved=0
+
+  saved="$(saved_config_for "$name")"
+  project_tmp="$(mktemp "${TMPDIR:-/tmp}/codex-accounts-projects.XXXXXX")"
+  merged_tmp="$(mktemp "${TMPDIR:-/tmp}/codex-accounts-config.XXXXXX")"
+
+  extract_project_tables "$CONFIG_FILE" "$project_tmp"
+
+  if [[ -f "$saved" ]]; then
+    cat "$saved" > "$merged_tmp"
+    had_saved=1
+  else
+    : > "$merged_tmp"
+  fi
+
+  if file_has_non_whitespace "$project_tmp"; then
+    if file_has_non_whitespace "$merged_tmp"; then
+      printf '\n' >> "$merged_tmp"
+    fi
+    cat "$project_tmp" >> "$merged_tmp"
+  fi
+
+  mkdir -p "$CODEX_HOME"
+  if file_has_non_whitespace "$merged_tmp"; then
+    mv "$merged_tmp" "$CONFIG_FILE"
+  else
+    rm -f "$CONFIG_FILE" "$merged_tmp"
+  fi
+
+  rm -f "$project_tmp"
+
+  if [[ $had_saved -eq 0 ]]; then
+    echo "[WARN] No saved config snapshot for '${name}'. Preserved only local [projects.*] settings."
+  fi
 }
 
 assert_auth_present_or_hint() {
@@ -412,6 +524,7 @@ resolve_current_name_or_prompt() {
   if [[ -z "${CURRENT:-}" && -f "$AUTH_FILE" ]]; then
     local named; named="$(prompt_account_name)"
     backup_current_to "$named"
+    save_current_config_to "$named"
     PREVIOUS=""        # No meaningful previous yet
     CURRENT="$named"
     save_state "$CURRENT" "$PREVIOUS"
@@ -451,6 +564,7 @@ cmd_save() {
     name="$(prompt_account_name)"
   fi
   backup_current_to "$name"
+  save_current_config_to "$name"
 
   # Update CURRENT, leave PREVIOUS as-is if already set
   load_state
@@ -497,10 +611,12 @@ cmd_switch() {
       CURRENT="$(prompt_account_name)"
     fi
     backup_current_to "$CURRENT"
+    save_current_config_to "$CURRENT"
   fi
 
   note "Switching to '${target}'..."
   restore_auth_from "$saved"
+  restore_config_from "$target"
 
   # Update state
   load_state
@@ -521,7 +637,7 @@ cmd_usage() {
   [[ ${#saved_accounts[@]} -gt 0 ]] || die "No saved accounts found in ${DATA_DIR}. Use '$0 save <name>' first."
 
   load_state
-  local saved name marker snapshot auth_type email plan rate_error
+  local saved saved_config name marker snapshot auth_type email plan rate_error
   local bucket_json primary_used primary_window primary_reset secondary_used secondary_window secondary_reset credit_mode credit_balance
   local title account_line primary_line secondary_line footer_line
   local -a cards=()
@@ -533,10 +649,11 @@ cmd_usage() {
 
   for saved in "${saved_accounts[@]}"; do
     name="$(basename "${saved%.json}")"
+    saved_config="$(saved_config_for "$name")"
     marker=""
     [[ "${CURRENT:-}" == "$name" ]] && marker=" (current)"
 
-    if snapshot="$(query_status_for_saved_auth "$saved" 2>&1)"; then
+    if snapshot="$(query_status_for_saved_auth "$saved" "$saved_config" 2>&1)"; then
       auth_type="$(printf '%s' "$snapshot" | jq -r '.account.type // "unknown"')"
       email="$(printf '%s' "$snapshot" | jq -r '.account.email // empty')"
       plan="$(printf '%s' "$snapshot" | jq -r '.account.planType // "unknown"')"
@@ -591,7 +708,8 @@ cmd_help() {
   cat <<EOF
 Switchboard (codex-accounts) — manage multiple Codex CLI accounts
 
-Only ~/.codex/auth.json is swapped; all other config/state is preserved.
+Swaps ~/.codex/auth.json plus account-scoped config.toml settings.
+Local [projects."<path>"] trust settings stay on the current machine.
 
 USAGE
   $0 list
@@ -602,6 +720,8 @@ USAGE
 
   $0 save [<name>]
       Save the current auth.json into ${DATA_DIR}/<name>.json.
+      Save account-scoped config into ${DATA_DIR}/<name>.config.toml.
+      Local [projects.*] config is excluded from the saved snapshot.
       If <name> is omitted, you'll be prompted.
 
   $0 add <name>
@@ -612,14 +732,15 @@ USAGE
 
   $0 switch <name>
       Switch to an existing saved account (name is mandatory).
-      Backs up current auth.json first, then activates <name>.
+      Backs up current auth.json/config first, then activates <name>.
+      Preserves current [projects.*] trust settings in ~/.codex/config.toml.
 
   $0 usage
       For each saved account, runs Codex inside an isolated temporary HOME,
       calls Codex's account/read + account/rateLimits/read endpoints,
       and renders 5-hour + weekly usage cards one per row.
       This is read-only and does not modify your active ~/.codex/auth.json
-      or saved account files.
+      or saved account files. Saved config snapshots are loaded when present.
 
 NOTES
   - Core switching is shell-only; 'usage' requires jq and network access.
